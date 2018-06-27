@@ -1,0 +1,267 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+  html_notebook:
+    fig_height: 8
+    fig_width: 10
+---
+
+we will analysis the 10X PMB4k data. Some fucntions we will use 
+
+```{r}
+source('~/Works/scripts/R_scripts/pmbc_functions.R')
+```
+# loading PBMC8k data
+
+We download 10X pmbc8k data from 10X website and load data by the following way
+```{r}
+pbmc.data<-read10X(mtx="~/Documents/datasets/pbmc4k/filtered_gene_bc_matrices/GRCh38/matrix.mtx",genes="~/Documents/datasets/pbmc4k/filtered_gene_bc_matrices/GRCh38/genes.tsv",barcodes = "~/Documents/datasets/pbmc4k/filtered_gene_bc_matrices/GRCh38/barcodes.tsv")
+rownames(pbmc.data$counts)<-pbmc.data$genes[,1]
+colnames(pbmc.data$counts)<-pbmc.data$samples[,'Barcode']
+```
+# QC and plots
+
+## general QCs
+
+Let's do some QC plots from this PMBC data. Here we will check `nUMI` (total nUMI for each cell), `nGenes` (total detected genes per cell)
+```{r}
+nUMI<-apply(pbmc.data$counts,2,sum)
+nGenes<-apply(pbmc.data$counts,2,function(x){sum(x>0)})
+pbmc.qc<-data.frame('nUMI'=nUMI,'nGenes'=nGenes)
+```
+Scatter plot of `nUMI vs nGenes` 
+```{r}
+ggscatter(pbmc.qc,x="nUMI",y="nGenes")+theme_bw()
+```
+## Advanced QCs
+
+### nUMI by MT-genes
+Here we would like to know the ` percMT(% UMI mapping to MT-genes)` 
+```{r}
+mt.genes <- grep(pattern = "^MT-", x = rownames(x = pbmc.data), value = TRUE)
+percMT<-apply(pbmc.data$counts[mt.genes,],2,sum)/nUMI
+pbmc.qc$mt<-percMT
+ggscatter(pbmc.qc,x="nUMI",y="mt")+theme_bw()
+
+```
+### nUMI by gene biotypes
+UMI counts distribution along with gene biotypes
+
+```{r}
+gtf_file<-'~/Documents/HCA/reference/gencode.v27.primary_assembly.annotation.gtf'
+gencode <- ParseGene(gtf_file)
+```
+Next, we summary the UMI counts mapping to genes stratified by biotypes.
+
+```{r}
+umi.biotype<-SummaryQuantificationByType(pbmc.data$counts,gencode,"gene_name",0)
+dim(umi.biotype)
+
+```
+
+Boxplot will show the % of UMI mapping to different biotyps
+
+```{r}
+umi.biotype.frac<-cbind("biotype"=umi.biotype[,1],umi.biotype[,-1]/nUMI)
+umi.biotype.frac.m<-melt(umi.biotype.frac)
+ggboxplot(umi.biotype.frac.m,x="biotype",y="value",orientation = "horizontal")+theme_bw()+scale_y_log10()
+```
+## Filtering un-wanted cells and genes
+
+We can filter cells by `nGenes`, `nUMI`, `percMT` and other QC measurements. For example, we would like to select cells satisfy the followings:  `nUMI >2000 && nGenes >200 && percMT<0.1`. Then we would like to use the genes satisfy `nCells >100 per gene`
+
+```{r}
+mlist<-nGenes >200 & nUMI>1000 & percMT <0.1
+sum(mlist)
+```
+Filter out genes. for example, filter out genes with low variance, genes with low number of expressed genes.
+
+```{r}
+n.genes<-apply(pbmc.data$counts[,mlist],1,function(x){sum(x>0)})
+n.sd<-apply(pbmc.data$counts[,mlist],1,sd)
+nlist<-n.genes>100 & n.sd>0.2
+pbmc.final<-pbmc.data$counts[nlist,mlist]
+dim(pbmc.final)
+pbmc.final.log2<-log(pbmc.final+1,base=2)
+```
+
+### Gene Expression CV
+
+calcaute standard deviation, overall mean, coef of variation(CV) of each gene 
+```{r}
+pbmc.var<-apply(pbmc.final.log2,1,var)
+pbmc.avg<-apply(pbmc.final.log2,1,mean)
+pbmc.cv<-pbmc.var/pbmc.avg
+x<-data.frame('gene'=rownames(pbmc.final.log2),'avg'=pbmc.avg,'var'=pbmc.var,'CV'=pbmc.cv)
+ggscatter(data=x,x="avg",y='CV')
+gghistogram(data=x, x='CV')
+```
+Or we can use the geometric mean
+```{r}
+pbmc.geom.var<-apply(pbmc.final.log2,1,function(x){var(x[x>0])})
+pbmc.geom.avg<-apply(pbmc.final.log2,1,function(x){mean(x[x>0])})
+pbmc.geom.cv<-pbmc.geom.var/pbmc.geom.avg
+y<-data.frame('sd'=pbmc.geom.var,'avg'=pbmc.geom.avg,'CV'=pbmc.geom.cv)
+ggscatter(data=y,x="avg",y='CV')
+
+```
+### Co-expression genes
+
+Sometimes, highly variable genes are also co-expressed together. Here we will examine the correlation of high variable genes. First, we calculate the gene expression correlation matrix and then sort the x,y-axis by the standard deviation of genes.
+
+```{r}
+sd.order<-order(pbmc.var,decreasing = T)
+```
+calculate pairwise correlation bwt genes
+```{r}
+dist_cor<-cor(t(pbmc.final.log2),method="pearson")
+```
+sort correlation matrix by variance of genes
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+dist_cor.sorted<-dist_cor[sd.order,sd.order]
+aheatmap(dist_cor.sorted[1:1000,1:1000],Colv=FALSE,Rowv = FALSE,main = "Correlation among high variable genes")
+```
+# Normalization
+First, we scale each cell by their total UMI and generated a "UMI per million" values
+## Bulk approach
+In the past, several normalization approach had been developped for bulk sequencing, such RPM/FPKM/TPM, TMM. These methods are more or less alike to each other: find a scaling factors and scale RNA-Seq gene read counts to some kind "baseline". For RPM/FPKM/TPM, are still applied to scRNA-Seq as the first step data processing. Especially for the full-length transcriptome scRNA-Seq, such as SmartSeq2 protocol. For 3' tag scRNA-Seq, since it only targets the partial transcripts, the FPKM/TPM probably are not applicable anymore, but RPM still can be applied. TMM or other scaling methods, such DESeq, limma/VOOM approach, would scale gene counts by the overall "median/mean" across samples, these overall "median/mean" can be either abosolute mean/median or geometric median/mean. 
+### RPM
+`reads per million` 
+```{r}
+pbmc.rpm<-rpm(pbmc.final)
+pbmc.rpm.log<-log(pbmc.rpm$rpm+1,base=2)
+```
+### TMM - Trimmed Mean of M-value
+Use `edgeR` package to generate TMM factors
+```{r}
+pbmc.tmm <- DGEList(counts=pbmc.final)
+pbmc.tmm <- calcNormFactors(pbmc.tmm,method="TMM")
+pbmc.tmm.lcpm <- cpm(pbmc.tmm, log=TRUE)
+```
+### DESeq2 RLE - Relative Log Expression
+Generate RLE scaling factors: 
+```{r}
+pbmc.rle <- DGEList(counts=pbmc.final)
+pbmc.rle <- calcNormFactors(pbmc.rle,method="RLE")
+pbmc.rle.lcpm <- cpm(pbmc.rle, log=TRUE)
+```
+### Pair-wise compare
+Now we can pair-wise compare these 3 normalization method. First, we calculate the difference/fold changes between two normalization methods, then summary number of genes with significant fold changes and then stratify by biotypes.
+```{r}
+lcpm<-list('tmm'=pbmc.tmm.lcpm,'rle'=pbmc.rle.lcpm,'rpm'=pbmc.rpm.log)
+lcpm.comp<-compareNormExpr(lcpm,names=c('tmm','rle','rpm'),gencode,log=TRUE)
+```
+Then we visualize the difference between normlization in boxplots
+```{r}
+plotCompNormExpr(lcpm.comp)
+```
+
+## visualization of normalization
+we will visualize known gene signatures in t-SNE plots
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+genes <- c("CD79A","NKG7","CD3D","CST3","CD8A","PF4")
+tsne<-plotTSNE(lcpm,genes)
+```
+
+```{r}
+print(tsne$plots$tmm)
+print(tsne$plots$rle)
+print(tsne$plots$rpm)
+```
+
+# Run PCA 
+Two approach, regular PCA to reduce dimension or random PCA approach. 
+## Run PCA
+We will try several PCA approach. 
+genes. 
+```{r}
+## random PCA
+pbmc.rpcs.pcs<-doPCA(lcpm,'rpca')
+## fast PCA
+pbmc.fast.pcs<-doPCA(lcpm,'fast')
+## Regular PCA, essentially, fast.prcomp is the same as prcomp.
+pbmc.regular.pcs<-doPCA(lcpm,'regular')
+pbmc.pcs<-list('rpcs'=pbmc.rpcs.pcs,'fast'=pbmc.fast.pcs,'regular'=pbmc.regular.pcs)
+```
+
+Plot PCA eigenvectors
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+## rpcs
+screeplot(pbmc.pcs$rpcs$tmm,type = 'lines',title="TMM RPCA Screeplot")
+screeplot(pbmc.pcs$rpcs$rle,type = 'lines',title="RLE RPCA Screeplot")
+screeplot(pbmc.pcs$rpcs$rpm,type = 'lines',title="RPM RPCA Screeplot")
+## fast prcomp
+screeplot(pbmc.pcs$fast$tmm,type = 'lines',title="TMM PCA Screeplot")
+screeplot(pbmc.pcs$fast$rle,type = 'lines',title="RLE PCA Screeplot")
+screeplot(pbmc.pcs$fast$rpm,type = 'lines',title="RPM PCA Screeplot")
+```
+two different PCA approach produce similar PCA results. `random PCA` approach is much faster though. 
+
+# Run Clustering
+We will try several clustering approach. 
+## SNN-Cliq
+First, we can use `SNN-Cliq` on top 200 PCs
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+m1<-doSNNCluster(pbmc.pcs$rpcs$tmm$rotation[,1:20])
+names(m1)<-rownames(pbmc.pcs$rpcs$tmm$rotation)
+table(m1)
+```
+Or we can run `SNN-Cliq` on all genes
+```{r}
+m2<-doSNNCluster(t(lcpm$tmm))
+names(m2)<-rownames(pbmc.pcs$rpcs$tmm$rotation)
+table(m2)
+```
+We can project the memberships into t-SNE plots
+```{r}
+d<-data.frame('X1'=tsne$Y$tmm$X1,'X2'=tsne$Y$tmm$X2,'SNN membership.PCs'=as.factor(m1),'SNN membership.ALL'=as.factor(m2))
+md<-melt(d,id.vars = c("X1","X2"))
+ggscatter(data=md,x='X1',y='X2',color='value',facet.by = 'variable',show.legend.text=FALSE,shape="value",font.label = 8)+theme_bw()
+
+```
+
+So Running `SNN-cliq` on top PCs matrix and the whole gene matrix produces similar results
+
+## Louvain clustering
+Run Louvain on `rpcs` results. 
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+out<-plotTSneClustering(pbmc.pcs$rpcs,tsne,'Louvain')
+pls<-out$plots
+d.louvain<-as.data.frame(out$mem)
+print(pls$tmm)
+print(pls$rle)
+print(pls$rpm)
+
+```
+Calculate Rand index between clustering memberhip
+```{r}
+adjustedRandIndex(d.louvain$tmm,d$rle)
+adjustedRandIndex(d.louvain$tmm,d$rpm)
+adjustedRandIndex(d.louvain$rle,d$rpm)
+```
+## Infomap clustering
+
+```{r message=FALSE, warning=FALSE, paged.print=FALSE}
+out<-plotTSneClustering(pbmc.pcs$rpcs,tsne,'Infomap')
+pls<-out$plots
+d.infomap<-as.data.frame(out$mem)
+print(pls$tmm)
+print(pls$rle)
+print(pls$rpm)
+```
+
+Calculate Rand index between clustering memberhip
+```{r}
+adjustedRandIndex(d.infomap$tmm,d.infomap$rle)
+adjustedRandIndex(d.infomap$tmm,d.infomap$rpm)
+adjustedRandIndex(d.infomap$rle,d.infomap$rpm)
+```
+
+## Comparing Infomap vs Louvain
+```{r}
+adjustedRandIndex(d.louvain$tmm,d.infomap$tmm)
+adjustedRandIndex(d.louvain$rle,d.infomap$rle)
+adjustedRandIndex(d.louvain$rpm,d.infomap$rpm)
+```
